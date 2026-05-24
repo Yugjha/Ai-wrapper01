@@ -1,25 +1,22 @@
 """
-Hybrid Retriever v7 — SpellCorrector with transposition-aware fallback.
+Hybrid Retriever v8 — With Streaming Support
 
-v7 changes (SpellCorrector only — all other v6 logic unchanged):
-  1. Added _levenshtein() helper for edit-distance computation.
-  2. Added _fuzzy_fallback(): catches transpositions (midea→media) and
-     edit errors (journlism→journalism) that difflib misses.
-  3. Fallback only triggers when difflib (cutoff=0.92) finds no match.
-  4. Length-scaled threshold: len 5-6 → transpositions only;
-     len 7-8 → dist ≤ 1; len ≥ 9 → dist ≤ 2. Prevents short-word
-     over-correction (horse→nurse, clasp→class).
+v8 changes:
+  1. Added retrieve_and_stream() method for real-time token streaming
+  2. Integrated StreamingLLM for Anthropic/Google streaming
+  3. Full retrieval pipeline + LLM streaming in one method
+  4. Backward compatible with existing retrieve() method
 
-v6 changes (for reference):
-  1. Proper noun protection: words capitalised in original query are skipped.
-  2. Cutoff raised 0.85 → 0.92 (prevents "relativity"→"creativity").
-  3. Minimum length guard: words ≤ 4 chars are never corrected.
-  4. Explicit no-match behaviour: keep original word, never drop it.
+v7 changes (for reference):
+  - SpellCorrector with transposition-aware fallback
+  - All other v6 logic unchanged
 """
-from typing import List, Dict, Any
+
+from typing import List, Dict, Any, Generator
 from dataclasses import dataclass
 from pinecone_client import PineconeClient
 from neo4j_client import Neo4jClient
+from streaming_llm import StreamingLLM  # ✅ NEW
 from difflib import get_close_matches
 import os, json, re
 
@@ -84,15 +81,14 @@ class LLMReformulator:
             response = self.client.models.generate_content(model=self.model, contents=prompt, config=config)
             lines = [re.sub(r'^[\d\.\-\*\)\]]+\s*', '', l).strip().lower()
                      for l in response.text.strip().split('\n') if l.strip() and len(l.strip()) > 5]
-            # Deduplicate lines that are too similar to the original query
             orig_words = set(query.lower().split())
             diverse = []
             for line in lines[:3]:
                 line_words = set(line.split())
                 overlap = len(line_words & orig_words) / max(len(line_words), 1)
-                if overlap < 0.85:  # Only keep if meaningfully different
+                if overlap < 0.85:
                     diverse.append(line)
-                elif not diverse:   # Always keep at least one
+                elif not diverse:
                     diverse.append(line)
             return diverse if diverse else self._basic_fallback(query)
         except Exception: return self._basic_fallback(query)
@@ -105,14 +101,8 @@ class LLMReformulator:
         return [' '.join(words)] if words else []
 
 class SpellCorrector:
-    """
-    Course-vocabulary spell corrector — v7 transposition-aware.
-
-    Guards against proper noun mangling (Albert→alert, relativity→creativity).
-    v7: Added Levenshtein + transposition fallback so minor typos like
-        "midea"→"media" or "journlism"→"journalism" are caught even when
-        difflib similarity falls below the 0.92 cutoff.
-    """
+    """Course-vocabulary spell corrector — v7 transposition-aware."""
+    
     def __init__(self, cache_path: str = "data/spell_vocab.json"):
         self.vocab = set()
         if os.path.exists(cache_path):
@@ -135,25 +125,12 @@ class SpellCorrector:
         return prev[-1]
 
     def _fuzzy_fallback(self, word: str) -> str:
-        """
-        Fallback for words that difflib missed.
-
-        Two separate thresholds:
-          TRANSPOSITION (same chars, different order) — always allowed up to
-            dist ≤ 2, regardless of word length. These are unambiguously typos.
-          GENERAL Levenshtein — length-scaled to avoid false corrections:
-            - len 5–6 : NOT allowed (too risky for short words)
-            - len 7–8 : dist ≤ 1
-            - len ≥ 9 : dist ≤ 2
-
-        Returns the best (lowest edit distance) match, or empty string.
-        """
+        """Fallback for words that difflib missed."""
         word_sorted = sorted(word)
         word_len = len(word)
 
-        # Max Levenshtein allowed for general (non-transposition) edits
         if word_len <= 6:
-            general_max = 0   # general edits not allowed for short words
+            general_max = 0
         elif word_len <= 8:
             general_max = 1
         else:
@@ -165,16 +142,13 @@ class SpellCorrector:
         for v in self.vocab:
             v_len = len(v)
 
-            # --- Transposition path: same sorted chars ---
             if sorted(v) == word_sorted:
-                # Length must be identical for a true transposition
                 if v_len == word_len:
                     dist = self._levenshtein(word, v)
                     if 0 < dist <= 2 and dist < best_dist:
                         best_dist = dist; best_word = v
                 continue
 
-            # --- General Levenshtein path ---
             if general_max == 0:
                 continue
             if abs(v_len - word_len) > general_max:
@@ -188,8 +162,6 @@ class SpellCorrector:
     def correct(self, query: str) -> str:
         if not self.vocab: return query
 
-        # Detect proper nouns BEFORE lowercasing
-        # Any word starting with uppercase in the original is treated as a proper noun
         proper_nouns = {w.lower() for w in query.split() if w and w[0].isupper() and len(w) > 1}
 
         stopwords = {
@@ -210,42 +182,49 @@ class SpellCorrector:
         fixed = []; changed = False
 
         for raw_word in words:
-            # Strip leading/trailing punctuation so "litaracy??" → "litaracy"
             word = raw_word.strip('.,!?;:\'"()[]{}')
 
-            # Skip: stopword, already in vocab, too short, or proper noun
             if (word in stopwords or word in self.vocab
                     or len(word) <= 4 or word in proper_nouns):
                 fixed.append(raw_word); continue
 
-            # Primary: difflib close match (high precision, misses transpositions)
             matches = get_close_matches(word, list(self.vocab), n=1, cutoff=0.92)
             if matches:
-                # Re-attach any trailing punctuation to the corrected word
                 suffix = raw_word[len(word):]
                 fixed.append(matches[0] + suffix); changed = True
             else:
-                # Fallback: Levenshtein / transposition check for minor typos
                 fallback = self._fuzzy_fallback(word)
                 if fallback:
                     suffix = raw_word[len(word):]
                     fixed.append(fallback + suffix); changed = True
                 else:
-                    fixed.append(raw_word)  # No match — keep original unchanged
+                    fixed.append(raw_word)
 
         result = ' '.join(fixed)
         if changed: print(f"🔧 Spell corrected: '{query}' → '{result}'")
         return result
 
 class EnhancedHybridRetriever:
+    """
+    Enhanced Hybrid Retriever with Streaming Support (v8)
+    
+    Features:
+    - Multi-query reformulation (spell correction + LLM)
+    - Vector search (Pinecone) + BM25 + Graph context (Neo4j)
+    - Reciprocal Rank Fusion (RRF) for combining results
+    - Streaming LLM responses with full retrieval context
+    """
+    
     def __init__(self, pinecone_index: str = "pdf-knowledge-base"):
         self.pinecone_client = PineconeClient(pinecone_index)
         self.neo4j_client = Neo4jClient()
         self.bm25 = BM25Index()
         self.reformulator = LLMReformulator()
         self.spell_corrector = SpellCorrector()
+        self.streaming_llm = StreamingLLM(provider="anthropic")  # ✅ NEW
 
     def retrieve(self, query: str, top_k: int = 12) -> RetrievedContext:
+        """Original non-streaming retrieval method (backward compatible)"""
         corrected = self.spell_corrector.correct(query)
         reformulated = self.reformulator.reformulate(corrected)
         all_queries = [corrected] + reformulated
@@ -305,6 +284,41 @@ class EnhancedHybridRetriever:
         combined = self._build_context(query, final_results, graph_context)
         return RetrievedContext(vector_results=final_results, graph_context=graph_context,
                                 combined_context=combined, expanded_queries=all_queries)
+
+    # ─────────────────────────────────────────────────────────────
+    # ✅ NEW: Streaming Method
+    # ─────────────────────────────────────────────────────────────
+    
+    def retrieve_and_stream(
+        self, 
+        query: str, 
+        top_k: int = 12,
+        provider: str = "anthropic"
+    ) -> Generator[str, None, None]:
+        """
+        Retrieve relevant context + Stream LLM response token-by-token
+        
+        Args:
+            query: User question
+            top_k: Number of top results to retrieve
+            provider: LLM provider ("anthropic" or "google")
+        
+        Yields:
+            Response tokens in real-time
+        """
+        # Step 1: Full retrieval pipeline
+        retrieved_context = self.retrieve(query, top_k=top_k)
+        
+        # Step 2: Stream LLM response with context
+        yield from self.streaming_llm.stream_response(
+            query=query,
+            context=retrieved_context.combined_context,
+            provider=provider
+        )
+
+    # ─────────────────────────────────────────────────────────────
+    # Helper Methods (unchanged)
+    # ─────────────────────────────────────────────────────────────
 
     def _get_graph_context(self, results):
         neo4j_ids = []
