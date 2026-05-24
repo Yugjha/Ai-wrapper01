@@ -5,6 +5,11 @@ Merged version combining:
 - Downloads main.py      (CLI with follow-up questions, ask_question_with_follow_ups)
 - worker/main.py         (FastAPI API + CLI combined, model-switch API routes, reference links)
 
+v8 additions:
+- Streaming endpoint (/chat/stream) with hybrid retriever
+- Real-time token-by-token response generation
+- HybridRetriever integration for RAG + streaming
+
 Run as API server:  python main.py
                     uvicorn main:app --reload
 Run as CLI:         python main.py --cli
@@ -15,17 +20,28 @@ import sys
 import base64
 import binascii
 import time
+import json
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Generator
 import uvicorn
 from chatbot import PDFChatbot
 from llm_client import AVAILABLE_MODELS, ModelConfig
 from sarvam_client import SarvamClient, LANGUAGE_DISPLAY
 from utils import MAX_AUDIO_BYTES, s2s_limiter
+
+# ✅ NEW: Import streaming retriever
+try:
+    from hybrid_retriever import HybridRetriever
+    STREAMING_AVAILABLE = True
+except ImportError:
+    STREAMING_AVAILABLE = False
+    print("⚠️  HybridRetriever not available - streaming disabled")
+
 try:
     from Db import find_reference_links, check_db_connection
 except ImportError:
@@ -44,8 +60,8 @@ S2S_TIMING_LOG_FILE = "s2s_timing_log.txt"
 
 app = FastAPI(
     title="Digilab — Media Literacy Chatbot API",
-    description="API for the IGNOU Media Literacy Course Chatbot with reference links",
-    version="3.0.0",
+    description="API for the IGNOU Media Literacy Course Chatbot with reference links & streaming",
+    version="3.1.0",
 )
 
 app.add_middleware(
@@ -58,6 +74,7 @@ app.add_middleware(
 
 chatbot = None
 sarvam_client = None
+streaming_retriever = None  # ✅ NEW
 
 # ─────────────────────────────────────────────────────────────
 # Pydantic Models
@@ -66,6 +83,11 @@ sarvam_client = None
 class QuestionRequest(BaseModel):
     question: str
     use_history: Optional[bool] = True
+
+class StreamingChatRequest(BaseModel):  # ✅ NEW
+    question: str
+    top_k: int = 12
+    provider: str = "anthropic"
 
 class ModelSwitchRequest(BaseModel):
     model_key: str  # "1", "2", or "3"
@@ -88,6 +110,7 @@ class HealthResponse(BaseModel):
     message: str
     db_connected: bool
     current_model: str
+    streaming_available: bool  # ✅ NEW
 
 class SelectionRequest(BaseModel):
     selected_text: str        # The text the user highlighted
@@ -256,7 +279,8 @@ def print_follow_up_questions(follow_up_questions):
 
 @app.on_event("startup")
 async def startup_event():
-    global chatbot, sarvam_client
+    global chatbot, sarvam_client, streaming_retriever
+    
     try:
         chatbot = PDFChatbot()
         print(f"✅ Chatbot initialized — model: {chatbot.model_config.display_name}")
@@ -270,6 +294,17 @@ async def startup_event():
     except Exception as e:
         sarvam_client = None
         print(f"⚠️  Sarvam speech client unavailable: {e}")
+
+    # ✅ NEW: Initialize streaming retriever
+    if STREAMING_AVAILABLE:
+        try:
+            streaming_retriever = HybridRetriever()
+            print("✅ Streaming retriever initialized (Pinecone + FAISS + Hybrid)")
+        except Exception as e:
+            streaming_retriever = None
+            print(f"⚠️  Streaming retriever unavailable: {e}")
+    else:
+        print("⚠️  Streaming not available (HybridRetriever not installed)")
 
     if check_db_connection():
         print("✅ MySQL DB connected — reference links enabled")
@@ -286,6 +321,13 @@ async def root():
         "message": "Digilab Media Literacy Chatbot API is running",
         "docs": "/docs",
         "health": "/health",
+        "endpoints": {
+            "chat": "/chat (full response)",
+            "chat_simple": "/chat/simple (lightweight)",
+            "chat_stream": "/chat/stream (streaming - NEW)",
+            "model_switch": "/model/switch",
+            "model_current": "/model/current",
+        }
     }
 
 
@@ -296,6 +338,7 @@ async def health_check():
         "message": "Digilab Media Literacy Chatbot API is running",
         "db_connected": check_db_connection(),
         "current_model": chatbot.model_config.display_name if chatbot else "Not initialized",
+        "streaming_available": streaming_retriever is not None,  # ✅ NEW
     }
 
 
@@ -349,6 +392,61 @@ async def chat_simple(request: QuestionRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
+
+
+# ─────────────────────────────────────────────────────────────
+# ✅ NEW: STREAMING ENDPOINT
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/chat/stream")
+async def chat_stream(request: StreamingChatRequest):
+    """
+    Stream chatbot response with full retrieval context.
+    
+    Real-time token-by-token generation using hybrid retriever
+    (Pinecone + FAISS + LLM streaming).
+    
+    Returns: Server-Sent Events (SSE) stream
+    
+    Example:
+    ```
+    curl -N http://localhost:8000/chat/stream \\
+      -X POST \\
+      -H "Content-Type: application/json" \\
+      -d '{"question":"What is media literacy?","top_k":5}'
+    ```
+    """
+    if streaming_retriever is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="Streaming service not initialized. Check HybridRetriever setup."
+        )
+    if not request.question or not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+    
+    def generate() -> Generator[str, None, None]:
+        """Generate SSE stream with tokens"""
+        try:
+            print(f"🔄 Streaming query: {request.question[:50]}...")
+            
+            # Retrieve + Stream LLM response
+            for token in streaming_retriever.retrieve_and_stream(
+                query=request.question.strip(),
+                top_k=request.top_k,
+                provider=request.provider
+            ):
+                # Format as Server-Sent Events
+                yield f"data: {json.dumps({'token': token})}\n\n"
+            
+            # Signal completion
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            print("✅ Stream complete")
+            
+        except Exception as e:
+            print(f"❌ Stream error: {e}")
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+    
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.post("/chat/explain-selection")
@@ -765,10 +863,11 @@ if __name__ == "__main__":
             sys.exit(1)
 
         print("\n" + "=" * 60)
-        print("🚀 Starting Digilab API Server")
+        print("🚀 Starting Digilab API Server (v3.1.0 with Streaming)")
         print("=" * 60)
-        print("📡 API:  http://localhost:8000")
-        print("📚 Docs: http://localhost:8000/docs")
+        print("📡 API:      http://localhost:8000")
+        print("📚 Docs:     http://localhost:8000/docs")
+        print("🔄 Streaming: http://localhost:8000/chat/stream (NEW)")
         print("=" * 60 + "\n")
 
         uvicorn.run("main:app", host="localhost", port=8000, reload=True, log_level="info")
