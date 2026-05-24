@@ -14,7 +14,7 @@ load_dotenv()
 
 try:
     import mysql.connector
-    from mysql.connector import Error
+    from mysql.connector import Error, pooling
     # Enable MySQL connection
     MYSQL_AVAILABLE = True
 except ImportError:
@@ -23,22 +23,47 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────
-# Connection
+# Connection Pool
 # ─────────────────────────────────────────────────────────────
 
+connection_pool = None
+
+def init_pool():
+    """Initialize MySQL connection pool."""
+    global connection_pool
+    if not MYSQL_AVAILABLE:
+        return
+    
+    try:
+        connection_pool = pooling.MySQLConnectionPool(
+            pool_name="omeka_pool",
+            pool_size=5,
+            pool_reset_session=True,
+            host=os.getenv("MYSQL_HOST", "127.0.0.1"),
+            port=int(os.getenv("MYSQL_PORT", 3306)),
+            user=os.getenv("MYSQL_USER", "root"),
+            password=os.getenv("MYSQL_PASSWORD", ""),
+            database=os.getenv("MYSQL_DATABASE", "u604560806_mile"),
+            connect_timeout=5,
+        )
+        print("✅ Connection pool initialized!")
+    except Exception as e:
+        print(f"❌ Failed to initialize pool: {e}")
+        connection_pool = None
+
 def get_connection():
-    """Create and return a MySQL connection."""
+    """Get connection from pool."""
+    global connection_pool
     if not MYSQL_AVAILABLE:
         raise RuntimeError("mysql-connector-python is not installed.")
-
-    return mysql.connector.connect(
-        host=os.getenv("MYSQL_HOST", "127.0.0.1"),
-        port=int(os.getenv("MYSQL_PORT", 3306)),
-        user=os.getenv("MYSQL_USER", "root"),
-        password=os.getenv("MYSQL_PASSWORD", ""),
-        database=os.getenv("MYSQL_DATABASE", "u604560806_mile"),
-        connect_timeout=5,
-    )
+    
+    if connection_pool is None:
+        init_pool()
+    
+    if connection_pool is None:
+        raise RuntimeError("Failed to initialize connection pool.")
+    
+    return connection_pool.get_connection()
 
 
 # ─────────────────────────────────────────────────────────────
